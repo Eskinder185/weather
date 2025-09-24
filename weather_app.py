@@ -1,143 +1,240 @@
-"""
-Simple asynchronous weather app
-================================
+"""Simple weather app with CLI output and a tiny web interface.
 
-This module defines a small command‐line application that fetches the current
-temperature and wind speed for a handful of cities.  It uses the public
-`Open‑Meteo` API, which does not require an API key for non‑commercial use.  By
-default the script queries the weather for a few example cities, but you can
-specify your own coordinates via command‑line arguments.  The program is
-written using Python's `asyncio` and `aiohttp` libraries to perform
-HTTP requests concurrently, showcasing asynchronous programming techniques.
-
-The underlying API returns weather forecast data in JSON format.  We call
-`https://api.open-meteo.com/v1/forecast` with the ``latitude`` and
-``longitude`` query parameters and request current temperature and wind speed
-via the ``current`` query parameter.  According to Open‑Meteo, the service
-offers free access without an API key and provides accurate weather
-forecasts for any location around the world【37812235958545†L12-L33】【37812235958545†L121-L132】.
-
-Example usage::
-
-    python weather_app.py
-
-    # or specifying custom coordinates for San Francisco
-    python weather_app.py --city "San Francisco" --lat 37.7749 --lon -122.4194
-
-The script will display the current temperature and wind speed for the
-requested locations.  It can easily be extended to fetch additional weather
-variables such as humidity or precipitation.
+The application fetches current weather data from the Open-Meteo API for one
+or more cities.  When run in CLI mode it prints the latest weather figures in
+plain text.  With the ``--serve`` flag it starts a small HTTP server that
+exposes a home page, an about page, and a FAQ page.
 """
 
 import argparse
-import asyncio
+import html
+import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional
-
-import aiohttp
+from functools import partial
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, Iterable, List, Optional
+from urllib import error, parse, request
 
 
 @dataclass
 class City:
-    """Data class representing a city and its geographic coordinates."""
+    """Represents a city and the coordinates to query."""
 
     name: str
     latitude: float
     longitude: float
 
 
-async def fetch_weather(session: aiohttp.ClientSession, city: City) -> Optional[Dict[str, float]]:
-    """Fetch current temperature and wind speed for a given city.
-
-    Args:
-        session: The ``aiohttp`` client session used to make HTTP requests.
-        city: A ``City`` instance with a name and coordinates.
-
-    Returns:
-        A dictionary containing the city's name, temperature and wind speed
-        in metric units, or ``None`` if the request fails.
-    """
-    url = (
-        "https://api.open-meteo.com/v1/forecast?"
-        f"latitude={city.latitude}&longitude={city.longitude}&"
-        "current=temperature_2m,wind_speed_10m"
+def fetch_weather(city: City) -> Optional[Dict[str, float]]:
+    """Fetch current temperature and wind speed for a single city."""
+    params = parse.urlencode(
+        {
+            "latitude": city.latitude,
+            "longitude": city.longitude,
+            "current": "temperature_2m,wind_speed_10m",
+        }
     )
+    url = f"https://api.open-meteo.com/v1/forecast?{params}"
     try:
-        async with session.get(url) as response:
-            data = await response.json()
-            current = data.get("current", {})
-            temperature = current.get("temperature_2m")
-            wind_speed = current.get("wind_speed_10m")
-            if temperature is None or wind_speed is None:
-                return None
-            return {
-                "city": city.name,
-                "temperature": temperature,
-                "wind_speed": wind_speed,
-            }
-    except Exception:
+        with request.urlopen(url, timeout=10) as response:
+            payload = response.read()
+    except (error.URLError, TimeoutError):
         return None
 
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError:
+        return None
 
-async def gather_weather(cities: List[City]) -> List[Optional[Dict[str, float]]]:
-    """Concurrently fetch weather data for multiple cities."""
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_weather(session, city) for city in cities]
-        return await asyncio.gather(*tasks)
+    current = data.get("current", {})
+    temperature = current.get("temperature_2m")
+    wind_speed = current.get("wind_speed_10m")
+    if temperature is None or wind_speed is None:
+        return None
+
+    return {
+        "city": city.name,
+        "temperature": float(temperature),
+        "wind_speed": float(wind_speed),
+    }
+
+
+def get_weather_for_cities(cities: Iterable[City]) -> List[Optional[Dict[str, float]]]:
+    """Retrieve weather information for a collection of cities."""
+    return [fetch_weather(city) for city in cities]
+
+
+def format_cli_output(results: List[Optional[Dict[str, float]]]) -> List[str]:
+    lines: List[str] = []
+    for result in results:
+        if result is None:
+            lines.append("Failed to fetch weather data.")
+            continue
+        lines.append(
+            f"{result['city']}: Temperature {result['temperature']:.1f} C, "
+            f"Wind Speed {result['wind_speed']:.1f} m/s"
+        )
+    return lines
+
+
+def render_html_page(title: str, body: str) -> bytes:
+    """Wrap provided body content in a simple HTML template."""
+    html_doc = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 2rem; max-width: 800px; }}
+    nav a {{ margin-right: 1rem; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+    th, td {{ border: 1px solid #ccc; padding: 0.5rem; text-align: left; }}
+    th {{ background: #f0f0f0; }}
+    footer {{ margin-top: 2rem; font-size: 0.9rem; color: #555; }}
+  </style>
+</head>
+<body>
+  <nav>
+    <a href=\"/\">Home</a>
+    <a href=\"/about\">About</a>
+    <a href=\"/faq\">FAQ</a>
+  </nav>
+  {body}
+  <footer>Weather data courtesy of <a href=\"https://open-meteo.com/\">Open-Meteo</a>.</footer>
+</body>
+</html>"""
+    return html_doc.encode("utf-8")
+
+
+class WeatherRequestHandler(BaseHTTPRequestHandler):
+    """Serve the home, about, and FAQ pages."""
+
+    def __init__(self, *args, cities: Iterable[City], **kwargs):
+        self._cities = list(cities)
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self) -> None:  # noqa: N802 (match BaseHTTPRequestHandler signature)
+        if self.path == "/" or self.path.startswith("/?"):
+            self._handle_home()
+        elif self.path == "/about":
+            self._handle_about()
+        elif self.path == "/faq":
+            self._handle_faq()
+        else:
+            self._handle_not_found()
+
+    def _write_response(self, content: bytes, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _handle_home(self) -> None:
+        results = get_weather_for_cities(self._cities)
+        rows = []
+        for result in results:
+            if result is None:
+                rows.append("<tr><td colspan=\"3\">Failed to fetch weather data.</td></tr>")
+            else:
+                rows.append(
+                    "<tr><td>{city}</td><td>{temp:.1f} C</td><td>{wind:.1f} m/s</td></tr>".format(
+                        city=html.escape(result["city"]),
+                        temp=result["temperature"],
+                        wind=result["wind_speed"],
+                    )
+                )
+        body = """
+  <h1>Current Weather</h1>
+  <p>The latest readings for the configured cities.</p>
+  <table>
+    <thead>
+      <tr><th>City</th><th>Temperature</th><th>Wind Speed</th></tr>
+    </thead>
+    <tbody>
+      {rows}
+    </tbody>
+  </table>
+""".format(rows="\n      ".join(rows))
+        self._write_response(render_html_page("Weather Home", body))
+
+    def _handle_about(self) -> None:
+        body = """
+  <h1>About</h1>
+  <p>This demo pulls current weather conditions from the Open-Meteo service and
+     presents them through a tiny built-in web server.</p>
+  <p>Use the command line options to customise which cities are shown.</p>
+"""
+        self._write_response(render_html_page("About", body))
+
+    def _handle_faq(self) -> None:
+        body = """
+  <h1>Frequently Asked Questions</h1>
+  <h2>Which API do you use?</h2>
+  <p>All weather data comes from the free Open-Meteo API.</p>
+  <h2>How often is the data updated?</h2>
+  <p>The latest values are fetched each time you refresh the page.</p>
+  <h2>Can I add more cities?</h2>
+  <p>Yes.  Run the script with the command line options shown below to specify a
+     different location.</p>
+"""
+        self._write_response(render_html_page("FAQ", body))
+
+    def _handle_not_found(self) -> None:
+        body = """
+  <h1>404 - Not Found</h1>
+  <p>The page you requested does not exist.  Try one of the links above.</p>
+"""
+        self._write_response(render_html_page("Not Found", body), status=404)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003 (inherit signature)
+        """Silence default logging to keep console output tidy."""
+        return
+
+
+def run_server(cities: Iterable[City], host: str = "127.0.0.1", port: int = 8000) -> None:
+    handler = partial(WeatherRequestHandler, cities=list(cities))
+    with HTTPServer((host, port), handler) as httpd:
+        print(f"Serving weather pages on http://{host}:{port}/ (Ctrl+C to stop)")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nServer stopped.")
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command‑line arguments.  Users may specify a single city via
-    ``--city``, ``--lat`` and ``--lon`` or rely on default example cities.
-    """
-    parser = argparse.ArgumentParser(description="Asynchronous weather app using Open‑Meteo API")
-    parser.add_argument(
-        "--city",
-        help="Name of the city for custom query (used in the output only)",
-    )
-    parser.add_argument(
-        "--lat",
-        type=float,
-        help="Latitude of the city for custom query",
-    )
-    parser.add_argument(
-        "--lon",
-        type=float,
-        help="Longitude of the city for custom query",
-    )
+    parser = argparse.ArgumentParser(description="Weather app using the Open-Meteo API")
+    parser.add_argument("--city", help="Name of the city for custom query")
+    parser.add_argument("--lat", type=float, help="Latitude for the custom city")
+    parser.add_argument("--lon", type=float, help="Longitude for the custom city")
+    parser.add_argument("--serve", action="store_true", help="Start the web server instead of the CLI output")
+    parser.add_argument("--host", default="127.0.0.1", help="Host interface for the web server")
+    parser.add_argument("--port", type=int, default=8000, help="Port for the web server")
     return parser.parse_args()
 
 
-def main() -> None:
-    """Entry point for the script."""
-    args = parse_args()
-    # Default cities include the user's home city Atlanta (33.753746, -84.386330)【284928131702522†L9-L12】
-    # and a few international examples.  These values can be updated or
-    # extended as desired.
-    default_cities: List[City] = [
-        City("Atlanta", 33.753746, -84.386330),
+def build_cities(args: argparse.Namespace) -> List[City]:
+    if args.lat is not None and args.lon is not None:
+        name = args.city if args.city else "Custom Location"
+        return [City(name, args.lat, args.lon)]
+    return [
+        City("Atlanta", 33.753746, -84.38633),
         City("London", 51.5072, -0.1276),
         City("Tokyo", 35.6762, 139.6503),
     ]
-    cities_to_query: List[City]
-    # If the user specifies custom coordinates, override the default list
-    if args.lat is not None and args.lon is not None and args.city:
-        cities_to_query = [City(args.city, args.lat, args.lon)]
-    else:
-        cities_to_query = default_cities
 
-    # Run the asynchronous tasks
-    results = asyncio.run(gather_weather(cities_to_query))
 
-    # Display the results
-    for result in results:
-        if result is None:
-            print("Failed to fetch weather data.")
-            continue
-        print(
-            f"{result['city']}: Temperature {result['temperature']}°C, "
-            f"Wind Speed {result['wind_speed']} m/s"
-        )
+def main() -> None:
+    args = parse_args()
+    cities = build_cities(args)
+
+    if args.serve:
+        run_server(cities, host=args.host, port=args.port)
+        return
+
+    results = get_weather_for_cities(cities)
+    for line in format_cli_output(results):
+        print(line)
 
 
 if __name__ == "__main__":
