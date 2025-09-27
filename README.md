@@ -6,7 +6,7 @@ Requirements: Python 3.8+
 Install:
 
 python -m venv .venv
-# Windows: .venv\Scripts\activate
+# Windows:
 # macOS/Linux: source .venv/bin/activate
 pip install aiohttp
 
