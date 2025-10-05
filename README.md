@@ -1,4 +1,4 @@
-# Async Weather CLI (Open-Meteo)
+# Async Weather CLI 
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Async](https://img.shields.io/badge/Async-asyncio%20%7C%20aiohttp-5b5)
